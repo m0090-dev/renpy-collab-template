@@ -1,0 +1,93 @@
+# Ren'Py Web ビルド → GitHub Pages 公開（ブランチ別公開つき）
+#
+# 動作:
+#   - main への push       → ビルドしてサイトのルート "/" に公開
+#   - 作業ブランチへの push → ビルドして "/<ブランチ名>/" に公開
+#   - 公開先は gh-pages ブランチ（Pages の公開ソースを
+#     「Deploy from a branch: gh-pages / root」に設定すること）
+#
+# 仕組み:
+#   - 公開は peaceiris/actions-gh-pages で gh-pages ブランチへ書き込む。
+#     keep_files: true なので、main の公開でブランチ用フォルダは消えず、
+#     ブランチの公開でルートや他ブランチのフォルダも消えない。
+#   - ブランチを削除したときの掃除は cleanup-preview.yml が担当する。
+#
+# 注意:
+#   - ブランチ名は英小文字とハイフンのみ（URL のフォルダ名になるため）。
+#   - SDK と成果物は必ずリポジトリの外（$RUNNER_TEMP）に置く。
+#     プロジェクトフォルダの中に置くと、Ren'Py の配布ビルドが
+#     SDK ごと game.zip に詰め込んでしまい、100MB を超えて push できなくなる。
+#   - main の公開では、過去の main ビルドにだけ存在した古いファイルが
+#     ルートに残ることがある。ファイル名はほぼ固定なので実害は小さい。
+
+name: build-and-deploy-web
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pages-publish
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      RENPY_VERSION: "8.6.1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ren'Py SDK を取得（リポジトリの外に置く）
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -L -o sdk.tar.bz2 "https://www.renpy.org/dl/${RENPY_VERSION}/renpy-${RENPY_VERSION}-sdk.tar.bz2"
+          tar -xjf sdk.tar.bz2
+          mv "renpy-${RENPY_VERSION}-sdk" renpy-sdk
+          curl -L -o web.zip "https://www.renpy.org/dl/${RENPY_VERSION}/renpy-${RENPY_VERSION}-web.zip"
+          unzip -o web.zip -d renpy-sdk
+          test -f renpy-sdk/web/hash.txt
+
+      - name: Lint
+        env:
+          SDK_DIR: ${{ runner.temp }}/renpy-sdk
+        run: |
+          SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
+            "$SDK_DIR/renpy.sh" "$GITHUB_WORKSPACE" lint || true
+
+      - name: Web ビルド
+        env:
+          SDK_DIR: ${{ runner.temp }}/renpy-sdk
+          OUT_DIR: ${{ runner.temp }}/webout
+        run: |
+          SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
+            "$SDK_DIR/renpy.sh" "$SDK_DIR/launcher" web_build "$GITHUB_WORKSPACE" --destination "$OUT_DIR"
+          test -f "$OUT_DIR/index.html"
+          ls -lh "$OUT_DIR"
+          # game.zip が 90MB を超えたら異常（何かを巻き込んでいる）ので止める
+          test "$(stat -c%s "$OUT_DIR/game.zip")" -lt 94371840
+
+      - name: 公開（main → ルート）
+        if: github.ref == 'refs/heads/main'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
+          publish_dir: ${{ runner.temp }}/webout
+          keep_files: true
+          commit_message: "deploy main: ${{ github.sha }}"
+
+      - name: 公開（作業ブランチ → /<ブランチ名>/）
+        if: github.ref != 'refs/heads/main'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
+          publish_dir: ${{ runner.temp }}/webout
+          destination_dir: ${{ github.ref_name }}
+          keep_files: true
+          commit_message: "deploy ${{ github.ref_name }}: ${{ github.sha }}"
